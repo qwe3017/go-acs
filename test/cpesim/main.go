@@ -79,6 +79,8 @@ type simulator struct {
 	// ACS 不指定 Interface 时设备一发包就 no route。
 	pingNeedIface string
 
+	// optical：给主机加上 PON 光功率参数（模拟光猫自己上报收/发光）。
+	optical bool
 	// fttrOptical：给 FTTR 子设备加上光功率参数（模拟光纤组网子机）。
 	fttrOptical bool
 	// fttrWireless / fttrWired：把这些实例（1-based 子设备序号）做成无线 / 有线组网，
@@ -166,6 +168,8 @@ func main() {
 	var fttrOptical bool
 	var fttrWireless, fttrWired string
 	flag.BoolVar(&fttrOptical, "fttr-optical", false, "给 FTTR 子设备加光功率参数（模拟光纤组网子机）")
+	var optical bool
+	flag.BoolVar(&optical, "optical", false, "给主机加 PON 光功率参数（模拟光猫自己上报收/发光）")
 	flag.StringVar(&fttrWireless, "fttr-wifi", "", "把哪些 FTTR 子设备做成无线组网（子设备序号，逗号分隔，如 1,3）")
 	flag.StringVar(&fttrWired, "fttr-eth", "", "把哪些 FTTR 子设备做成有线组网（子设备序号，逗号分隔）")
 	flag.IntVar(&s.fttr, "fttr", 0, "模拟 FTTR 子设备（从光猫）数量，0 表示没有")
@@ -179,6 +183,7 @@ func main() {
 	s.diagDelay = diagDelay
 	s.pingNeedIface = pingNeedIface
 	s.fttrOptical = fttrOptical
+	s.optical = optical
 	s.fttrWireless = parseIntSet(fttrWireless)
 	s.fttrWired = parseIntSet(fttrWired)
 	s.noWAN = noWAN
@@ -460,6 +465,29 @@ func (s *simulator) buildParams(root, specVersion string) {
 		set(wan+"X_HW_SERVICELIST", "INTERNET", "string")
 	}
 
+	// PON 接入的光功率（可选，-optical 打开）：模拟真机 V271-20（PON、联通定制）的怪样子 ——
+	// 读数在一个**名字拼错的私有对象**下（X_GponInterafceConfig），
+	// 而旁边另一个对象报的是没换算的原始值（254 / 10000）。
+	// 界面必须选中前者，后者不能被当成 dBm 显示。
+	// 名字与真机实测一致（2026-09-30）。
+	if s.optical {
+		// 整数近似值那一组（真机是 -15 / 0 / 43 / 3226 / 29）
+		pon := root + "WANDevice.1.X_GponInterafceConfig."
+		set(pon+"RXPower", "-15", "int")
+		set(pon+"TXPower", "0", "int")
+		set(pon+"TransceiverTemperature", "43", "int")
+		set(pon+"SupplyVoltage", "3226", "int")
+		set(pon+"BiasCurrent", "29", "int")
+		// 光模块寄存器原始值那一组（SFF-8472 编码，界面要按映射表换算：
+		// 收光 -15.95 dBm / 发光 0.00 dBm / 43.0 ℃ / 3.226 V / 29.0 mA）
+		tr := root + "WANDevice.1.X_CU_WANEdgeONTPONInterfaceConfig.OpticalTransceiver."
+		set(tr+"RXPower", "254", "int")
+		set(tr+"TXPower", "10000", "int")
+		set(tr+"Temperature", "11008", "int")
+		set(tr+"Vcc", "32260", "int")
+		set(tr+"TXBias", "14500", "int")
+	}
+
 	// 无线参数。
 	// 特意把实例号做成 **1 和 5**（不是 1 和 2）—— 真机（华为 HN8145X6N）就是这么编号的，
 	// 写死 1/2 会读空。
@@ -539,6 +567,15 @@ func (s *simulator) buildParams(root, specVersion string) {
 		set(wlan+"5.AssociatedDevice.1.AssociatedDeviceIPAddress", "192.168.1.21", "string")
 		set(wlan+"5.AssociatedDevice.1.RSSI", "-52", "string")
 		set(wlan+"5.AssociatedDevice.1.FrequencyWidth", "160MHz", "string")
+
+		// 射频对象（真机华为 HN8145X6N / V271-20 都有）：`LANDevice.1.WiFi.Radio.{i}`，
+		// 编号是 1/2，跟 SSID 实例号（1/5）**对不上**。以前按实例号硬合并，
+		// 会凭空多出一行「5G ｜ - ｜ 开 ｜ -」的无效显示（用户 2026-09-30 截图就是这个）。
+		radio := root + "LANDevice.1.WiFi.Radio."
+		set(radio+"1.Enable", "1", "boolean")
+		set(radio+"1.OperatingFrequencyBand", "2.4GHz", "string")
+		set(radio+"2.Enable", "1", "boolean")
+		set(radio+"2.OperatingFrequencyBand", "5GHz", "string")
 
 		// 主机列表（TR-098）：终端名靠它按 MAC 对出来（关联终端表里通常没有名字）
 		hosts := root + "LANDevice.1.Hosts."

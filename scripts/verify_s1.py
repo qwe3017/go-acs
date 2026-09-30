@@ -456,6 +456,9 @@ def main():
           and "待办任务" not in cards and "失败任务" not in cards,
           re.sub(r"\s+", " ", cards)[:200])
     check("看板有频段/射频列", "频段" in html and "射频" in html)
+    # 收光/发光两列：列表里没有设备报过就不显示（跟 FTTR/WAN 区块一个规矩）
+    check("没有设备上报光功率时不出现「收光 / 发光」列",
+          "<th>收光</th>" not in html and "<th>发光</th>" not in html, "")
 
     print("== 13. 无线概况是自动采集的（不用手工点）==")
     d98 = [d for d in api_devices() if d["SerialNumber"] == "VERIFY098"]
@@ -467,6 +470,12 @@ def main():
               [n for n in names if "WLAN" in n][:3])
         check("自动采集到了频段（X_HW_RFBand）",
               any(n.endswith("X_HW_RFBand") for n in names))
+        # 射频对象（WiFi.Radio.{i}）的编号跟 SSID 实例号对不上（真机是 1/2 与 1/5），
+        # 按实例号硬合并会凭空造出一个「5G ｜ - ｜ 开 ｜ -」的假实例（用户截图见过）
+        st, dhtml = get(f"/devices/{d98[0]['ID']}")
+        sec = dhtml.split("无线（WiFi）", 1)[1].split("<h2>", 1)[0] if "无线（WiFi）" in dhtml else ""
+        check("无线概况不把射频对象当成 SSID 实例", "/wifi/2" not in sec, sec[:160])
+        check("无线概况仍然列出 1 与 5 两个实例", "/wifi/1" in sec and "/wifi/5" in sec, "")
         # 只取摘要字段 + 关联终端（弹窗要看「谁连上来」），
         # 不能把整棵几百个参数的子树拉回来。条数会随已连终端数变化，所以上限给得宽松：
         # 只有在明显把整棵子树都拉回来时才算失败。
@@ -1359,6 +1368,16 @@ def main():
         st, h = get("/settings")
         check("设置页提示监听地址改动需重启后生效", "重启服务后生效" in h, st)
 
+        # 待重启时该给出「立即重启服务」按钮（改端口不用再去命令行）
+        check("待重启时给出「立即重启服务」按钮",
+              'action="/settings/restart"' in h and "立即重启服务" in h, st)
+        check("重启按钮带二次确认", "确定现在重启服务吗" in h, "")
+        check("重启说明里写明失败会自动回退", "自动退回旧地址" in h, "")
+        check("重启接口只认 POST（GET 405）", get_code("/settings/restart") == 405,
+              get_code("/settings/restart"))
+        st2, h2 = get("/settings")
+        check("只给按钮、没有拃自重启", st2 == 200 and "重启服务后生效" in h2, st2)
+
         # 非法输入要被拦下
         st, loc = post_form("/settings", {"acs_listen": "abc", "web_listen": "",
                                           "auth": "1", "web_user": user})
@@ -1771,6 +1790,73 @@ def main():
             except Exception:  # noqa: BLE001
                 proc.kill()
             logf.close()
+
+    # == 38. 主机收光 / 发光：详情页「基本信息」里那两行 ==
+    print("== 38. 主机收光 / 发光（详情页基本信息）==")
+    sim_bin = os.path.join(workdir, "cpesim")
+    if not os.path.exists(sim_bin):
+        print("   （没有模拟器可执行文件，跳过）")
+    else:
+        # -optical：模拟 PON 光猫自己上报收/发光（同时带一对没换算的原始值当诱饵）
+        sim = start_sim(sim_bin, BASE, "OPTICAL1", "-oui", "0A0B0C", "-interval", "5s", "-optical")
+        try:
+            d = None
+            for _ in range(40):
+                d = next((x for x in api_devices() if x["SerialNumber"] == "OPTICAL1"), None)
+                if d:
+                    break
+                time.sleep(1)
+            check("带光功率的模拟设备已纳管", bool(d), d and d.get("SerialNumber"))
+
+            # 映射表（厂商私有参数 → 面板字段）得在库里，且种了华为那款光猫的实测映射
+            con = sqlite3.connect(f"file:{workdir}/acs.db?mode=ro", uri=True)
+            n_alias = con.execute("SELECT COUNT(*) FROM param_aliases WHERE enabled = 1").fetchone()[0]
+            decodes = {r[0] for r in con.execute(
+                "SELECT DISTINCT decode FROM param_aliases WHERE field IN ('rx_power','temperature','voltage')")}
+            con.close()
+            check("映射表 param_aliases 有种子数据", n_alias >= 10, n_alias)
+            check("种子映射带上了原始值换算规则",
+                  "dbm_01uw" in decodes and "div256" in decodes and "mv01" in decodes, decodes)
+            h = ""
+            if d:
+                did = d["ID"]
+                # 纳管时会自动采一次；再点「重新获取」确保拿到（这条也会顺带采光功率）
+                for _ in range(3):
+                    post_form(f"/devices/{did}/refresh", {})
+                    got = False
+                    for _ in range(20):
+                        time.sleep(1)
+                        st, h = get(f"/devices/{did}")
+                        if "dBm" in h:
+                            got = True
+                            break
+                    if got:
+                        break
+                st, h = get(f"/devices/{did}")
+                # 光模块寄存器原始值要按映射表（param_aliases）换算成真实读数，
+                # 数值与设备自己页面一致：254 → -15.95 dBm、10000 → 0.00 dBm…
+                check("「基本信息」里有收光功率（按映射换算）", "收光" in h and "-15.95 dBm" in h, st)
+                check("「基本信息」里有发光功率（按映射换算）", "发光" in h and "0.00 dBm" in h, st)
+                check("「基本信息」里有光模块温度", "光模块温度" in h and "43.0 ℃" in h, st)
+                check("「基本信息」里有光模块电压", "光模块电压" in h and "3.226 V" in h, st)
+                check("「基本信息」里有光模块偏流", "光模块偏流" in h and "29.00 mA" in h, st)
+                # 原始寄存器值不能直接当 dBm/℃ 显示
+                check("没换算的原始值不会被当成读数",
+                      "254 dBm" not in h and "10000 dBm" not in h
+                      and "11008 ℃" not in h and "32260 V" not in h, "")
+                # 同一个设备也要出现在**列表页**：有设备报光功率时那两列才显示
+                st, ihtml = get("/")
+                check("列表页出现「收光 / 发光」两列",
+                      "<th>收光</th>" in ihtml and "<th>发光</th>" in ihtml, "")
+                check("列表页显示收 / 发光读数",
+                      "-15.95 dBm" in ihtml and "0.00 dBm" in ihtml, "")
+                check("列表页不把没换算的原始值当成功率", "254 dBm" not in ihtml, "")
+        finally:
+            sim.terminate()
+            try:
+                sim.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                sim.kill()
 
     print()
     total = _n["pass"] + _n["fail"]

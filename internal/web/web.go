@@ -71,7 +71,22 @@ type Options struct {
 	Runtime RuntimeSettings
 	// Log 用来记面板登录等安全事件（nil = 不记）。
 	Log *slog.Logger
+	// Restart 由 cmd/acs 注入：让面板上「立即重启服务」能真把服务重启起来。
+	// nil = 没有这个能力（比如测试里），界面上会退回「自己去命令行重启」的说法。
+	// 进程这一侧的事（换进程、systemd 托管、回滚）都在 cmd/acs 里，web 只管界面。
+	Restart func() (RestartMode, error)
 }
+
+// RestartMode 说明这次重启是用哪种方式完成的 —— 影响界面上怎么告诉用户
+// 「接下来会发生什么」（systemd 拉起要等它几秒，自己起的新进程则是已经就绪）。
+type RestartMode string
+
+const (
+	// RestartSystemd：进程干净退出，等 systemd（Restart=always）把它拉起来。
+	RestartSystemd RestartMode = "systemd"
+	// RestartSelf：自己起了新进程，新地址已经确认能访问。
+	RestartSelf RestartMode = "self"
+)
 
 // Register 把面板路由挂到 mux 上。
 func Register(mux *http.ServeMux, st *store.Store, ctrl Controller, opt Options) error {
@@ -134,6 +149,8 @@ func Register(mux *http.ServeMux, st *store.Store, ctrl Controller, opt Options)
 	mux.HandleFunc("GET /{$}", guard(s.handleIndex))
 	mux.HandleFunc("GET /settings", guard(s.handleSettings))
 	mux.HandleFunc("POST /settings", guard(s.handleSettingsSave))
+	// 改完监听地址后「立即重启服务」：确认过才走这里（改端口必须重启才生效）
+	mux.HandleFunc("POST /settings/restart", guard(s.handleSettingsRestart))
 	mux.HandleFunc("GET /devices/{id}", guard(s.handleDevice))
 	mux.HandleFunc("POST /devices/{id}/refresh", guard(s.handleRefresh))
 	mux.HandleFunc("POST /devices/{id}/note", guard(s.handleDeviceNote))
@@ -301,10 +318,26 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 无线概况：一次查询拿全设备的无线参数，再按设备/频段整理
-	wifiParams, err := s.store.WifiParams()
+	// 无线概况 + 主机光功率：一次查询拿全（两者都只能按名字子串筛，合并省一次扫描）
+	wifiParams, opticalParams, err := s.store.SummaryParams()
 	if err != nil {
-		wifiParams = map[int64][]store.Param{}
+		wifiParams, opticalParams = map[int64][]store.Param{}, map[int64][]store.Param{}
+	}
+	// 收光 / 发光：只在**列表里真有设备报过**这两列时才显示
+	// （跟 FTTR / WAN 区块一个规矩：设备不报就不摆空列）
+	aliases, err := s.store.EnabledAliases()
+	if err != nil {
+		aliases = nil
+	}
+	opticalByDevice := map[int64]HostOptical{}
+	hasOptical := false
+	for id, ps := range opticalParams {
+		o := hostOpticalFrom(aliases, ps)
+		if !o.Has() {
+			continue
+		}
+		opticalByDevice[id] = o
+		hasOptical = true
 	}
 
 	// 搜索：服务端过滤（结果可以分享 URL，也不依赖 JS）。
@@ -349,6 +382,8 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		"Stats":        stats,
 		"WiFi":         wifiByDevice,
 		"ClientCounts": clientCounts,
+		"Optical":      opticalByDevice,
+		"HasOptical":   hasOptical,
 		"Query":        q,
 		"State":        state,
 		"AuthOn":       s.authEnabled(),
@@ -580,6 +615,13 @@ func (s *Server) handleDevice(w http.ResponseWriter, r *http.Request) {
 		wifiParams = map[int64][]store.Param{}
 	}
 
+	// 厂商私有参数 → 面板字段的映射（光模块读数用）。
+	// 读不到就退回叶子名启发式，页面上少几行，不影响别的。
+	aliases, err := s.store.EnabledAliases()
+	if err != nil {
+		aliases = nil
+	}
+
 	var diag *store.Task
 	diagHost := ""
 	diagIface := ""
@@ -631,7 +673,7 @@ func (s *Server) handleDevice(w http.ResponseWriter, r *http.Request) {
 		"DiagRunning":        diag != nil && (diag.Status == store.TaskRunning || diag.Status == store.TaskPending),
 		"Notice":             strings.TrimSpace(r.URL.Query().Get("msg")),
 		"NoticeErr":          r.URL.Query().Get("err") == "1",
-		"Basic":              basicInfo(d, params),
+		"Basic":              basicInfo(d, params, aliases),
 		"Params":             params,
 		"Tasks":              tasks,
 		"TaskHistoryLimit":   s.store.TaskHistoryLimit(),
@@ -995,7 +1037,7 @@ func writeJSONError(w http.ResponseWriter, err error, code int) {
 
 // basicInfo 组装详情页顶部「最基本的设备信息」。
 // 数据模型根未知时不做猜测，直接按已有参数原样展示。
-func basicInfo(d *store.Device, params []store.Param) []kv {
+func basicInfo(d *store.Device, params []store.Param, aliases []store.ParamAlias) []kv {
 	idx := make(map[string]string, len(params))
 	for _, p := range params {
 		idx[p.Name] = p.Value
@@ -1043,7 +1085,36 @@ func basicInfo(d *store.Device, params []store.Param) []kv {
 			kept = append(kept, x)
 		}
 	}
+
+	// 光模块读数（收光 / 发光 / 温度 / 电压 / 偏流）：单独放在最后。
+	//
+	// 显示口径：**只要这台设备报过其中任意一项，就把这几行都列出来**，没报的那几项写 -。
+	// 一项都不报就整组不显示 —— 跟 FTTR / WAN 区块一个规矩，不给没有光口的设备
+	// 摆五行动 `-` 的空壳。
+	//
+	// 取值走映射表（各家私有参数名 + 原始值换算），没登记过的机型退回叶子名启发式。
+	fields := ResolvePanelFields(aliases, params)
+	anyReported := false
+	for _, f := range fields {
+		if strings.TrimSpace(f.Value) != "" {
+			anyReported = true
+			break
+		}
+	}
+	if anyReported {
+		for _, f := range fields {
+			kept = append(kept, kv{f.Field.Label, orDash(f.Value)})
+		}
+	}
 	return kept
+}
+
+// orDash 空值显示成 "-"（如实呈现：没读到就是没读到，不编数）。
+func orDash(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "-"
+	}
+	return s
 }
 
 // defaultFetchPath 给「读取参数子树」表单一个合理的默认值。

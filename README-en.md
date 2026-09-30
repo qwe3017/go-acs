@@ -27,18 +27,27 @@ gateways: **onboard → inspect → configure → diagnose → manage sub-device
   when all probes fail (a powered-off device sends no TR-069 notification, so this is the only way to confirm)
 - **Operable**: persistent task queue, one-click device wake-up, reboot / delete device, a dedicated panel login
   page (session cookie, with logout), and retention limits for task and inform history
+- **Vendor-specific parameters have a mapping table**: every vendor names optical power / temperature
+  differently (and some report raw optical-module register values), so those mappings live in the
+  database (`param_aliases`) — supporting a new ONT is a few rows of data (`acs alias add`), and
+  unregistered models still fall back to leaf-name heuristics rather than showing nothing or invented numbers
+- **No command line needed to change listen ports**: after editing the addresses on the settings page, click
+  “Restart the service now” and the process swaps itself (unchanged ports hand their sockets to the new
+  process, so device informs never drop; a port that won't come up is rolled back on the spot)
 
 ## Screenshots
 
 > Data comes from the CPE simulator bundled with this repository; no real device information is included.
 
 Overview: device list (online status, serial number, software version, data model, last inform time, number of
-collected parameters, wireless client count; filterable by online / offline, with three states —
+collected parameters, wireless client count — plus Rx / Tx optical power columns whenever any device reports
+them; filterable by online / offline, with three states —
 online / probing / offline — and a 5-second auto-refresh toggle in the top-right) plus wireless overview
 
 ![Overview](docs/images/overview.png)
 
-Basic information, WAN connections, operations (wake / reboot / delete), notes; the same 5-second auto-refresh
+Basic information (including optical module readings: Rx / Tx power, temperature, voltage, bias current),
+WAN connections, operations (wake / reboot / delete), notes; the same 5-second auto-refresh
 toggle (shared with the list page) is in the top-right
 
 ![Device detail](docs/images/device.png)
@@ -54,7 +63,8 @@ Client list: grouped by host / sub-gateway, each client showing signal strength,
 ![Client list](docs/images/clients.png)
 
 Settings: listen addresses for the ACS and the panel, plus the panel login credentials
-(port changes take effect after restart, credentials take effect immediately)
+(port changes take effect after restart, credentials take effect immediately); after changing an address you
+can click “Restart the service now” instead of going back to the command line
 
 ![Settings](docs/images/settings.png)
 
@@ -65,7 +75,7 @@ Download the package for your architecture from
 with one command:
 
 ```bash
-VERSION=1.2.2                                   # replace with the version you downloaded
+VERSION=1.2.3                                   # replace with the version you downloaded
 tar xzf acs-$VERSION-linux-amd64.tar.gz
 cd acs-$VERSION-linux-amd64
 sudo ./install.sh                                                # by default both CWMP and panel use :7547
@@ -93,7 +103,7 @@ go build -o acs ./cmd/acs        # Go 1.27+; CGO_ENABLED=0 for a static binary
 Building release packages:
 
 ```bash
-scripts/build-release.sh v1.2.2   # output in dist/: amd64 + arm64 tarballs and SHA256SUMS
+scripts/build-release.sh v1.2.3   # output in dist/: amd64 + arm64 tarballs and SHA256SUMS
 ```
 
 On the device side, set the ACS URL to `http://<IP>:9090/acs`; real devices have also been seen configured with
@@ -170,7 +180,7 @@ probing progress is cleared.
 
 ```bash
 go test ./...                   # unit tests: protocol parsing / store / web
-bash scripts/verify-s1.sh       # 353 end-to-end checks: simulator drives real HTTP + SOAP, asserted one by one
+bash scripts/verify-s1.sh       # 368 end-to-end checks: simulator drives real HTTP + SOAP, asserted one by one
 bash scripts/verify-interop.sh  # 8 interoperability checks against GenieACS's official JS simulator
 ```
 
